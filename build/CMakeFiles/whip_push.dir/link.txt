@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/whip_push.dir/main.cpp.o -o whip_push  -Wl,-rpath,/usr/local/lib /usr/local/lib/libdatachannel.so.0.24.1 /usr/lib/x86_64-linux-gnu/libcurl.so -lavformat -lavcodec -lavutil -lavdevice -lswscale 
