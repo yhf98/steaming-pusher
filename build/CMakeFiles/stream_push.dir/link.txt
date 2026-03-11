@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/stream_push.dir/main.cpp.o -o stream_push  -Wl,-rpath,/usr/local/lib -lavformat -lavcodec -lavutil -lavdevice -lswscale /usr/local/lib/libdatachannel.so.0.24.1 /usr/lib/x86_64-linux-gnu/libcurl.so 

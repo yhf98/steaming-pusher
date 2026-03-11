@@ -123,16 +123,3 @@ cd stream-push && ./run.sh input.mp4 rtmp://192.168.0.138:2022/live/test
 在 RK3588/RK3566 等 ARM 平台，若 FFmpeg 编译时包含 `h264_rkmpp`，会自动使用硬件编码器。
 
 优先级: `h264_rkmpp` > `h264_v4l2m2m` > `libx264`
-
-
-
-
-curl http://192.168.0.138:7080/index/api/getMediaList
-
-
-ffmpeg \
--rtsp_transport tcp \
--i rtsp://192.168.0.138:7554/live/test \
--c copy \
--f flv \
-rtmp://192.168.0.138:1935/live/333

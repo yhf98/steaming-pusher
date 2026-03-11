@@ -1,3 +1,0 @@
-/root/workspace/ms-fish-recg-pro/whip-push-demo/build/CMakeFiles/stream_push.dir
-/root/workspace/ms-fish-recg-pro/whip-push-demo/build/CMakeFiles/edit_cache.dir
-/root/workspace/ms-fish-recg-pro/whip-push-demo/build/CMakeFiles/rebuild_cache.dir
