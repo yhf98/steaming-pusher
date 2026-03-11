@@ -1,48 +1,43 @@
 cmake_minimum_required(VERSION 3.10)
-project(stream_push LANGUAGES CXX C)
+project(streaming_pusher)
 
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# ============ 可选功能 ============
-option(ENABLE_WHIP "启用 WHIP/WebRTC 推流 (需要 libdatachannel + libcurl)" OFF)
+# Options
+option(ENABLE_WHIP "Enable WebRTC WHIP support" ON)
 
-# ============ FFmpeg (始终需要) ============
+# Find Dependencies
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(AVFORMAT REQUIRED libavformat)
-pkg_check_modules(AVCODEC REQUIRED libavcodec)
-pkg_check_modules(AVUTIL REQUIRED libavutil)
-pkg_check_modules(AVDEVICE REQUIRED libavdevice)
-pkg_check_modules(SWSCALE REQUIRED libswscale)
 
-add_executable(stream_push main.cpp)
+set(FFMPEG_LIBS libavformat libavcodec libavutil libswscale libavdevice)
+pkg_check_modules(FFMPEG REQUIRED ${FFMPEG_LIBS})
 
-target_include_directories(stream_push PRIVATE
-    ${AVFORMAT_INCLUDE_DIRS}
-    ${AVCODEC_INCLUDE_DIRS}
-    ${AVUTIL_INCLUDE_DIRS}
-    ${AVDEVICE_INCLUDE_DIRS}
-    ${SWSCALE_INCLUDE_DIRS}
-)
+# Source files
+set(SOURCES main.cpp)
+add_executable(streaming-pusher ${SOURCES})
 
-target_link_libraries(stream_push PRIVATE
-    ${AVFORMAT_LIBRARIES}
-    ${AVCODEC_LIBRARIES}
-    ${AVUTIL_LIBRARIES}
-    ${AVDEVICE_LIBRARIES}
-    ${SWSCALE_LIBRARIES}
-)
+# Include directories
+target_include_directories(streaming-pusher PRIVATE ${FFMPEG_INCLUDE_DIRS})
 
-# ============ WHIP/WebRTC (可选) ============
+# Link libraries
+target_link_libraries(streaming-pusher PRIVATE ${FFMPEG_LIBRARIES})
+
 if(ENABLE_WHIP)
-    find_package(LibDataChannel REQUIRED)
     find_package(CURL REQUIRED)
-    target_compile_definitions(stream_push PRIVATE ENABLE_WHIP)
-    target_link_libraries(stream_push PRIVATE
-        LibDataChannel::LibDataChannel
-        CURL::libcurl
-    )
-    message(STATUS "WHIP/WebRTC 支持: 已启用")
-else()
-    message(STATUS "WHIP/WebRTC 支持: 未启用 (轻量模式，仅 FFmpeg)")
+    pkg_check_modules(DATACHANNEL libdatachannel)
+    if(DATACHANNEL_FOUND)
+        target_compile_definitions(streaming-pusher PRIVATE ENABLE_WHIP)
+        target_include_directories(streaming-pusher PRIVATE ${CURL_INCLUDE_DIRS} ${DATACHANNEL_INCLUDE_DIRS})
+        target_link_libraries(streaming-pusher PRIVATE ${CURL_LIBRARIES} ${DATACHANNEL_LIBRARIES})
+    else()
+        message(WARNING "libdatachannel not found, WHIP support disabled")
+    endif()
 endif()
+
+if(WIN32)
+    target_link_libraries(streaming-pusher PRIVATE ws2_32)
+endif()
+
+# Installation
+install(TARGETS streaming-pusher DESTINATION bin)

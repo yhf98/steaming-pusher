@@ -12,6 +12,13 @@
 #include <algorithm>
 #include <functional>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 #ifdef ENABLE_WHIP
 #include <curl/curl.h>
 #include <rtc/rtc.hpp>
@@ -28,6 +35,10 @@ extern "C" {
 #include <libavdevice/avdevice.h>
 #include <libswscale/swscale.h>
 }
+
+#ifdef _WIN32
+#pragma comment(lib, "ws2_32.lib")
+#endif
 
 // ==================== 全局状态 ====================
 
@@ -80,7 +91,11 @@ static OutputType detect_output_type(const std::string &url) {
 enum class InputType { File, Camera, Stream, RawVideo };
 
 static InputType detect_input_type(const std::string &input) {
+#ifdef _WIN32
+    if (starts_with(input, "video=")) return InputType::Camera;
+#else
     if (starts_with(input, "/dev/video")) return InputType::Camera;
+#endif
     if (starts_with(input, "rtsp://") || starts_with(input, "rtmp://") ||
         starts_with(input, "http://") || starts_with(input, "https://"))
         return InputType::Stream;
@@ -106,9 +121,15 @@ static bool open_input(const std::string &input, InputType type, InputSource &sr
 
     if (type == InputType::Camera) {
         src.is_camera = true;
-        ifmt = (AVInputFormat *)av_find_input_format("v4l2");
+#ifdef _WIN32
+        ifmt = av_find_input_format("dshow");
+#elif defined(__APPLE__)
+        ifmt = av_find_input_format("avfoundation");
+#else
+        ifmt = av_find_input_format("v4l2");
+#endif
         if (!ifmt) {
-            fprintf(stderr, "[输入] 未找到 v4l2 输入格式\n");
+            fprintf(stderr, "[输入] 未找到合适的摄像头输入格式\n");
             return false;
         }
         char size_buf[32], fps_buf[16];
@@ -116,7 +137,9 @@ static bool open_input(const std::string &input, InputType type, InputSource &sr
         snprintf(fps_buf, sizeof(fps_buf), "%d", cam_fps);
         av_dict_set(&opts, "video_size", size_buf, 0);
         av_dict_set(&opts, "framerate", fps_buf, 0);
+#ifndef _WIN32
         av_dict_set(&opts, "input_format", "h264", 0);
+#endif
     } else if (type == InputType::Stream) {
         av_dict_set(&opts, "rtsp_transport", "tcp", 0);
         av_dict_set(&opts, "stimeout", "5000000", 0);
@@ -126,15 +149,9 @@ static bool open_input(const std::string &input, InputType type, InputSource &sr
     av_dict_free(&opts);
 
     if (ret < 0 && type == InputType::Camera) {
-        fprintf(stderr, "[输入] 摄像头不支持 H264 输出，回退到原始格式\n");
+        fprintf(stderr, "[输入] 摄像头尝试打开失败，重试默认配置\n");
         opts = nullptr;
-        char size_buf[32], fps_buf[16];
-        snprintf(size_buf, sizeof(size_buf), "%dx%d", cam_width, cam_height);
-        snprintf(fps_buf, sizeof(fps_buf), "%d", cam_fps);
-        av_dict_set(&opts, "video_size", size_buf, 0);
-        av_dict_set(&opts, "framerate", fps_buf, 0);
         ret = avformat_open_input(&src.fmt_ctx, input.c_str(), ifmt, &opts);
-        av_dict_free(&opts);
     }
 
     if (ret < 0) {
