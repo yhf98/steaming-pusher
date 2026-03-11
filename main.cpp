@@ -77,7 +77,7 @@ static OutputType detect_output_type(const std::string &url) {
 
 // ==================== 输入源检测 ====================
 
-enum class InputType { File, Camera, Stream };
+enum class InputType { File, Camera, Stream, RawVideo };
 
 static InputType detect_input_type(const std::string &input) {
     if (starts_with(input, "/dev/video")) return InputType::Camera;
@@ -193,45 +193,49 @@ struct H264Encoder {
     bool initialized = false;
 
     bool init(int width, int height, int fps, AVPixelFormat src_fmt, int bitrate = 2000000) {
-        const char *encoder_names[] = {"h264_rkmpp", "h264_v4l2m2m", "libx264", nullptr};
+        // 按优先级尝试编码器：NVENC (GPU) → libx264 (CPU，最通用)
+        const char *encoder_names[] = {"h264_nvenc", "libx264", nullptr};
         const AVCodec *codec = nullptr;
 
         for (int i = 0; encoder_names[i]; i++) {
-            codec = avcodec_find_encoder_by_name(encoder_names[i]);
-            if (codec) {
+            const AVCodec *c = avcodec_find_encoder_by_name(encoder_names[i]);
+            if (!c) continue;
+            // 尝试分配上下文并打开，失败则跳到下一个
+            AVCodecContext *test_ctx = avcodec_alloc_context3(c);
+            test_ctx->width     = width;
+            test_ctx->height    = height;
+            test_ctx->time_base = {1, fps};
+            test_ctx->framerate = {fps, 1};
+            test_ctx->gop_size  = fps * 2;
+            test_ctx->max_b_frames = 0;
+            test_ctx->pix_fmt   = AV_PIX_FMT_YUV420P;
+            test_ctx->bit_rate  = bitrate;
+            test_ctx->flags    |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            if (strcmp(encoder_names[i], "h264_nvenc") == 0) {
+                av_opt_set(test_ctx->priv_data, "preset", "p4", 0);
+                av_opt_set(test_ctx->priv_data, "tune",   "ll", 0);
+                av_opt_set(test_ctx->priv_data, "rc",     "cbr", 0);
+            } else {
+                av_opt_set(test_ctx->priv_data, "preset",  "ultrafast", 0);
+                av_opt_set(test_ctx->priv_data, "tune",    "zerolatency", 0);
+                av_opt_set(test_ctx->priv_data, "profile", "baseline", 0);
+            }
+            if (avcodec_open2(test_ctx, c, nullptr) == 0) {
                 printf("[编码器] 使用 %s\n", encoder_names[i]);
+                enc_ctx = test_ctx;
+                codec   = c;
                 break;
             }
-        }
-        if (!codec) {
-            codec = avcodec_find_encoder(AV_CODEC_ID_H264);
-            if (codec) printf("[编码器] 使用默认 H264 编码器: %s\n", codec->name);
-        }
-        if (!codec) {
-            fprintf(stderr, "[编码器] 未找到 H264 编码器\n");
-            return false;
+            avcodec_free_context(&test_ctx);
         }
 
-        enc_ctx = avcodec_alloc_context3(codec);
-        enc_ctx->width = width;
-        enc_ctx->height = height;
+        if (!enc_ctx) {
+            fprintf(stderr, "[编码器] 未找到可用的 H264 编码器\n");
+            return false;
+        }
         enc_ctx->time_base = {1, fps};
         enc_ctx->framerate = {fps, 1};
-        enc_ctx->gop_size = fps * 2;
-        enc_ctx->max_b_frames = 0;
-        enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-        enc_ctx->bit_rate = bitrate;
-        enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-
-        av_opt_set(enc_ctx->priv_data, "preset", "ultrafast", 0);
-        av_opt_set(enc_ctx->priv_data, "tune", "zerolatency", 0);
-        av_opt_set(enc_ctx->priv_data, "profile", "baseline", 0);
-
-        if (avcodec_open2(enc_ctx, codec, nullptr) < 0) {
-            fprintf(stderr, "[编码器] 打开编码器失败\n");
-            avcodec_free_context(&enc_ctx);
-            return false;
-        }
+        // enc_ctx 已在上面的探测循环中初始化并打开，无需重复设置
 
         sws_ctx = sws_getContext(width, height, src_fmt,
                                  width, height, AV_PIX_FMT_YUV420P,
@@ -937,7 +941,7 @@ static void print_usage(const char *prog) {
         "input (输入源):\n"
         "  /path/to/video.mp4       本地视频文件 (默认循环播放)\n"
         "  /dev/video0              V4L2 摄像头\n"
-        "  rtsp://...               RTSP 网络流\n\n"
+        "  -              stdin rawvideo (需配合 --rawvideo --width N --height N)\n\n"
         "output_url (推流地址):\n"
         "  rtmp://server/app/stream           RTMP 推流\n"
         "  srt://server:port?streamid=...     SRT 推流\n"
@@ -953,7 +957,8 @@ static void print_usage(const char *prog) {
         "  --fps    N     摄像头帧率 (默认 30)\n"
         "  --bitrate N    编码码率 bps (默认 2000000)\n"
         "  --loop         文件推流循环播放 (默认开启)\n"
-        "  --no-loop      文件推流不循环\n\n"
+        "  --no-loop      文件推流不循环\n"
+        "  --rawvideo     从 stdin 读取 BGR24 原始帧 (input 必须为 \"-\")\n\n"
         "示例:\n"
         "  %s video.mp4 rtmp://server/live/test\n"
         "  %s video.mp4 \"srt://server:10080?streamid=live/test\"\n"
@@ -975,6 +980,7 @@ int main(int argc, char *argv[]) {
     int cam_width = 1280, cam_height = 720, cam_fps = 30;
     int bitrate = 2000000;
     bool loop_file = true;
+    bool rawvideo_mode = false;  // --rawvideo: 从 stdin 读取 BGR24 原始帧
 
     std::vector<std::string> args;
     for (int i = 1; i < argc; i++) args.emplace_back(argv[i]);
@@ -986,6 +992,7 @@ int main(int argc, char *argv[]) {
         else if (args[i] == "--bitrate" && i + 1 < args.size()){ bitrate = std::stoi(args[++i]); }
         else if (args[i] == "--loop")    { loop_file = true; }
         else if (args[i] == "--no-loop") { loop_file = false; }
+        else if (args[i] == "--rawvideo") { rawvideo_mode = true; }
         else if (args[i] == "-h" || args[i] == "--help") { print_usage(argv[0]); return 0; }
         else if (input_str.empty()) input_str = args[i];
         else if (url_str.empty()) url_str = args[i];
@@ -1002,6 +1009,15 @@ int main(int argc, char *argv[]) {
     InputType input_type = detect_input_type(input_str);
     OutputType output_type = detect_output_type(url_str);
 
+    // rawvideo 模式：input 必须为 "-"（stdin），强制覆盖类型
+    if (rawvideo_mode) {
+        if (input_str != "-") {
+            fprintf(stderr, "[错误] --rawvideo 模式下 input 必须为 \"-\"\n");
+            return 1;
+        }
+        input_type = InputType::RawVideo;
+    }
+
 #ifndef ENABLE_WHIP
     if (output_type == OutputType::WHIP) {
         fprintf(stderr, "[错误] WHIP/WebRTC 未启用。请使用 cmake -DENABLE_WHIP=ON 重新编译。\n");
@@ -1010,10 +1026,316 @@ int main(int argc, char *argv[]) {
     }
 #endif
 
-    const char *input_type_name[] = {"文件", "摄像头", "网络流"};
+    const char *input_type_name[] = {"文件", "摄像头", "网络流", "RawVideo/stdin"};
     printf("=== stream_push 多协议推流 ===\n");
     printf("输入: %s (%s)\n", input_str.c_str(), input_type_name[(int)input_type]);
     printf("输出: %s (%s)\n", url_str.c_str(), output_type_name(output_type));
+
+    // ========== rawvideo/stdin 模式（完整独立分支，末尾 return）==========
+    if (input_type == InputType::RawVideo) {
+        fprintf(stderr, "[RawVideo] stdin BGR24 %dx%d @ %d fps, bitrate=%d\n",
+                cam_width, cam_height, cam_fps, bitrate);
+
+        // 1. 初始化 H264 编码器（BGR24 → YUV420P → H264）
+        H264Encoder encoder;
+        if (!encoder.init(cam_width, cam_height, cam_fps, AV_PIX_FMT_BGR24, bitrate))
+            return 1;
+
+        // 2. 提取 SPS/PPS
+        std::vector<uint8_t> sps_pps;
+        if (encoder.enc_ctx->extradata && encoder.enc_ctx->extradata_size > 0)
+            sps_pps = extract_sps_pps_from_extradata(
+                encoder.enc_ctx->extradata, encoder.enc_ctx->extradata_size);
+        if (!sps_pps.empty())
+            printf("SPS/PPS: %zu bytes\n", sps_pps.size());
+
+        // 3. 打开输出（FFmpeg / WHIP 均支持）
+        FFmpegOutput ffmpeg_out;
+        bool use_ffmpeg_output_rv = (output_type != OutputType::WHIP);
+
+        if (use_ffmpeg_output_rv) {
+            AVCodecParameters *enc_codecpar = avcodec_parameters_alloc();
+            avcodec_parameters_from_context(enc_codecpar, encoder.enc_ctx);
+            AVRational enc_tb = encoder.enc_ctx->time_base;
+            if (!ffmpeg_out.open(url_str, output_type, enc_codecpar, enc_tb,
+                                 cam_width, cam_height, nullptr, {0, 1})) {
+                avcodec_parameters_free(&enc_codecpar);
+                encoder.cleanup();
+                return 1;
+            }
+            avcodec_parameters_free(&enc_codecpar);
+            printf("连接成功，开始推流...\n");
+        }
+
+#ifdef ENABLE_WHIP
+        // 4. WHIP 信令（与原有逻辑完全对称）
+        std::shared_ptr<rtc::PeerConnection> rv_pc;
+        std::shared_ptr<rtc::Track> rv_videoTrack, rv_audioTrack;
+        std::atomic<bool> rv_pc_connected{false};
+        std::atomic<bool> rv_pli_requested{false};
+        const std::byte rv_opusSilence[] = {
+            std::byte{0xF8}, std::byte{0xFF}, std::byte{0xFE}};
+        double rv_last_audio = 0.0;
+
+        if (output_type == OutputType::WHIP) {
+            UrlParts url_parts = parse_url(url_str);
+            rtc::SetThreadPoolSize(2);
+
+            rtc::Configuration rtc_config;
+            rtc_config.disableAutoNegotiation = true;
+            rv_pc = std::make_shared<rtc::PeerConnection>(rtc_config);
+
+            std::mutex mtx;
+            std::condition_variable cv;
+            bool gathering_done = false;
+
+            rv_pc->onStateChange([&](rtc::PeerConnection::State state) {
+                const char *names[] = {"New","Connecting","Connected",
+                                       "Disconnected","Failed","Closed"};
+                printf("[WebRTC] 状态: %s\n", names[(int)state]);
+                if (state == rtc::PeerConnection::State::Connected)
+                    rv_pc_connected = true;
+                else if (state >= rtc::PeerConnection::State::Disconnected) {
+                    rv_pc_connected = false;
+                    if (state >= rtc::PeerConnection::State::Failed)
+                        g_running = false;
+                }
+            });
+            rv_pc->onGatheringStateChange([&](rtc::PeerConnection::GatheringState state) {
+                if (state == rtc::PeerConnection::GatheringState::Complete) {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    gathering_done = true;
+                    cv.notify_one();
+                }
+            });
+
+            const std::string cname = "stream-push";
+
+            rtc::Description::Audio audioMedia("audio", rtc::Description::Direction::SendOnly);
+            audioMedia.addOpusCodec(111);
+            audioMedia.addSSRC(2, cname, "stream", "audio");
+            rv_audioTrack = rv_pc->addTrack(audioMedia);
+            auto audioRtpCfg = std::make_shared<rtc::RtpPacketizationConfig>(2, cname, 111, 48000);
+            audioRtpCfg->startTimestamp = 0;
+            audioRtpCfg->sequenceNumber = 0;
+            auto audioPacketizer = std::make_shared<rtc::OpusRtpPacketizer>(audioRtpCfg);
+            auto audioSr = std::make_shared<rtc::RtcpSrReporter>(audioRtpCfg);
+            audioPacketizer->addToChain(audioSr);
+            rv_audioTrack->setMediaHandler(audioPacketizer);
+
+            rtc::Description::Video videoMedia("video", rtc::Description::Direction::SendOnly);
+            videoMedia.addH264Codec(96,
+                "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42c01f");
+            videoMedia.addSSRC(1, cname, "stream", "video");
+            rv_videoTrack = rv_pc->addTrack(videoMedia);
+            auto videoRtpCfg = std::make_shared<rtc::RtpPacketizationConfig>(1, cname, 96, 90000);
+            videoRtpCfg->startTimestamp = 0;
+            videoRtpCfg->sequenceNumber = 0;
+            auto videoPacketizer = std::make_shared<rtc::H264RtpPacketizer>(
+                rtc::NalUnit::Separator::StartSequence, videoRtpCfg);
+            auto videoSr = std::make_shared<rtc::RtcpSrReporter>(videoRtpCfg);
+            videoPacketizer->addToChain(videoSr);
+            auto nackResp = std::make_shared<rtc::RtcpNackResponder>();
+            videoSr->addToChain(nackResp);
+            auto pliHandler = std::make_shared<rtc::PliHandler>(
+                [&rv_pli_requested]() { rv_pli_requested = true; });
+            nackResp->addToChain(pliHandler);
+            rv_videoTrack->setMediaHandler(videoPacketizer);
+
+            rv_pc->setLocalDescription(rtc::Description::Type::Offer);
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                if (!cv.wait_for(lk, std::chrono::seconds(10),
+                                 [&] { return gathering_done; })) {
+                    fprintf(stderr, "[WebRTC] ICE gathering 超时\n");
+                    encoder.cleanup();
+                    return 1;
+                }
+            }
+
+            auto local_desc = rv_pc->localDescription();
+            if (!local_desc) {
+                fprintf(stderr, "[WebRTC] 无法获取本地 SDP\n");
+                encoder.cleanup();
+                return 1;
+            }
+
+            std::string sdp_offer = prepare_offer(local_desc->generateSdp());
+            std::string sdp_answer_raw;
+            bool signaling_ok = signaling_whip(url_str.c_str(), sdp_offer, sdp_answer_raw);
+            if (!signaling_ok)
+                signaling_ok = signaling_srs(url_parts, sdp_offer, sdp_answer_raw);
+
+            if (!signaling_ok) {
+                printf("[信令] 尝试踢掉旧 session...\n");
+                kickoff_old_stream(url_parts);
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                for (int attempt = 1; attempt <= 6 && g_running && !signaling_ok; attempt++) {
+                    printf("[信令] 重试 (%d/6)...\n", attempt);
+                    signaling_ok = signaling_whip(url_str.c_str(), sdp_offer, sdp_answer_raw);
+                    if (!signaling_ok)
+                        signaling_ok = signaling_srs(url_parts, sdp_offer, sdp_answer_raw);
+                    if (!signaling_ok)
+                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                }
+            }
+            if (!signaling_ok) {
+                fprintf(stderr, "[信令] 失败\n");
+                encoder.cleanup();
+                return 1;
+            }
+
+            std::string sdp_answer = prepare_answer(sdp_answer_raw);
+            try {
+                rv_pc->setRemoteDescription(
+                    rtc::Description(sdp_answer, rtc::Description::Type::Answer));
+            } catch (const std::exception &e) {
+                fprintf(stderr, "[WebRTC] setRemoteDescription 失败: %s\n", e.what());
+                encoder.cleanup();
+                return 1;
+            }
+
+            for (int i = 0; i < 100 && g_running && !rv_pc_connected; i++)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            if (!rv_pc_connected) {
+                fprintf(stderr, "[WebRTC] 连接超时\n");
+                encoder.cleanup();
+                return 1;
+            }
+            printf("连接成功，开始推流...\n");
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+#endif // ENABLE_WHIP
+
+        // 5. 推流循环
+        size_t frame_bytes = (size_t)cam_width * cam_height * 3;  // BGR24
+        std::vector<uint8_t> bgr_buf(frame_bytes);
+
+        AVFrame *raw_frame = av_frame_alloc();
+        raw_frame->format = AV_PIX_FMT_BGR24;
+        raw_frame->width  = cam_width;
+        raw_frame->height = cam_height;
+        av_frame_get_buffer(raw_frame, 1);
+
+        int rv_frame_count = 0;
+        int64_t frame_interval_us = 1000000LL / cam_fps;
+        int64_t next_frame_time   = av_gettime();
+
+        auto is_connected_rv = [&]() -> bool {
+            if (use_ffmpeg_output_rv) return ffmpeg_out.opened;
+#ifdef ENABLE_WHIP
+            if (output_type == OutputType::WHIP) return rv_pc_connected.load();
+#endif
+            return false;
+        };
+
+        while (g_running && is_connected_rv()) {
+#ifdef ENABLE_WHIP
+            // PLI：请求关键帧
+            if (output_type == OutputType::WHIP && rv_pli_requested.exchange(false))
+                encoder.request_keyframe();
+#endif
+            // 从 stdin 读取一完整 BGR24 帧
+            size_t total_read = 0;
+            while (total_read < frame_bytes && g_running) {
+                size_t n = fread(bgr_buf.data() + total_read, 1,
+                                 frame_bytes - total_read, stdin);
+                if (n == 0) {
+                    if (feof(stdin))
+                        fprintf(stderr, "\n[RawVideo] stdin EOF\n");
+                    else
+                        fprintf(stderr, "\n[RawVideo] stdin 读取错误\n");
+                    g_running = false;
+                    break;
+                }
+                total_read += n;
+            }
+            if (!g_running) break;
+
+            // 填入 AVFrame（处理 linesize 内存对齐）
+            for (int row = 0; row < cam_height; row++) {
+                memcpy(raw_frame->data[0] + row * raw_frame->linesize[0],
+                       bgr_buf.data() + row * cam_width * 3,
+                       cam_width * 3);
+            }
+
+            // 编码
+            AVPacket *enc_pkt = av_packet_alloc();
+            if (encoder.encode(raw_frame, enc_pkt)) {
+                double dts_sec = enc_pkt->pts * av_q2d(encoder.enc_ctx->time_base);
+                bool key = (enc_pkt->flags & AV_PKT_FLAG_KEY) != 0;
+
+                if (use_ffmpeg_output_rv) {
+                    ffmpeg_out.write_video(enc_pkt, encoder.enc_ctx->time_base);
+                    ffmpeg_out.generate_silence_up_to(dts_sec);
+                }
+#ifdef ENABLE_WHIP
+                else if (output_type == OutputType::WHIP && rv_videoTrack) {
+                    auto frame_data = build_frame_data(
+                        enc_pkt->data, enc_pkt->size, key, sps_pps);
+                    try {
+                        rtc::FrameInfo fi{std::chrono::duration<double>{dts_sec}};
+                        fi.isKeyFrame = key;
+                        rv_videoTrack->sendFrame(std::move(frame_data), fi);
+                        while (rv_last_audio < dts_sec) {
+                            rtc::binary ad(rv_opusSilence,
+                                           rv_opusSilence + sizeof(rv_opusSilence));
+                            rv_audioTrack->sendFrame(
+                                std::move(ad),
+                                rtc::FrameInfo{std::chrono::duration<double>{rv_last_audio}});
+                            rv_last_audio += 0.020;
+                        }
+                    } catch (const std::exception &e) {
+                        fprintf(stderr, "\n[发送] %s\n", e.what());
+                        g_running = false;
+                    }
+                }
+#endif
+                rv_frame_count++;
+            }
+            av_packet_free(&enc_pkt);
+            encoder.yuv_frame->pict_type = AV_PICTURE_TYPE_NONE;
+
+            if (rv_frame_count > 0 && rv_frame_count % cam_fps == 0) {
+                printf("\r推流中: %d 帧 (%.1f 秒)",
+                       rv_frame_count, (double)rv_frame_count / cam_fps);
+                fflush(stdout);
+            }
+
+            // 帧率限速
+            next_frame_time += frame_interval_us;
+            int64_t now = av_gettime();
+            if (next_frame_time > now) {
+                int64_t wait = next_frame_time - now;
+                while (wait > 0 && g_running) {
+                    int64_t chunk = std::min(wait, (int64_t)50000);
+                    av_usleep((unsigned)chunk);
+                    wait -= chunk;
+                }
+            } else {
+                next_frame_time = av_gettime();  // 落后时重置，避免追帧
+            }
+        }
+
+        printf("\n推流结束，共发送 %d 帧\n", rv_frame_count);
+
+        // 清理
+        av_frame_free(&raw_frame);
+        encoder.cleanup();
+        if (use_ffmpeg_output_rv) ffmpeg_out.close();
+#ifdef ENABLE_WHIP
+        if (output_type == OutputType::WHIP) {
+            if (!g_whip_resource_url.empty()) http_delete(g_whip_resource_url);
+            if (rv_videoTrack) rv_videoTrack->close();
+            if (rv_audioTrack) rv_audioTrack->close();
+            if (rv_pc) rv_pc->close();
+        }
+#endif
+        printf("资源已释放。\n");
+        return 0;
+    }
+    // ========== rawvideo 模式结束 ==========
 
     // ========== 1. 打开输入源 ==========
     InputSource src;
